@@ -870,12 +870,14 @@ first."
 (defun read-string-or-nil (string)
   (and (< 1 (length string))
        (equal #\" (char string 0))
-       (with-output-to-string (*standard-output*)
-         (loop for c = (read-char) do
-              (case c
-                (#\" (return))
-                (#\\ (write-char (read-char)))
-                (t (write-char c)))))))
+       (handler-case (with-input-from-string (*standard-input* string :start 1)
+                       (with-output-to-string (*standard-output*)
+                         (loop for c = (read-char) do
+                              (case c
+                                (#\" (return))
+                                (#\\ (write-char (read-char)))
+                                (t (write-char c))))))
+         (end-of-file () nil))))
 
 (defun authenticate-client (stream)
   (let ((secret (slime-secret)))
