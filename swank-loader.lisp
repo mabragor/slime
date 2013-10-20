@@ -26,9 +26,6 @@
 
 (cl:in-package :swank-loader)
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (ql:quickload 'cl-secure-read))
-
 (defvar *source-directory*
   (make-pathname :name nil :type nil
                  :defaults (or *load-pathname* *default-pathname-defaults*))

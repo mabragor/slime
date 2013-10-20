@@ -11,7 +11,7 @@
 ;;; available to us here via the `SWANK-BACKEND' package.
 
 (defpackage :swank
-  (:use :cl :swank-backend :swank-match :swank-rpc :cl-secure-read)
+  (:use :cl :swank-backend :swank-match :swank-rpc)
   (:export #:startup-multiprocessing
            #:start-server 
            #:create-server
@@ -173,20 +173,9 @@ Backend code should treat the connection structure as opaque.")
      (pushnew ,func *new-connection-hook*)
      ,@body))
 
-(defparameter *valid-rpcs*
-  '(:emacs-rex :return :emacs-interrupt
-    :write-string :debug :debug-condition :debug-activate :debug-return :channel-send
-    :presentation-start :presentation-end
-    :new-package :new-features :ed :indentation-update
-    :eval :eval-no-wait :background-message :inspect :ping
-    :y-or-n-p :read-from-minibuffer :read-string :read-aborted :test-delay
-    :emacs-pong :emacs-return :emacs-return-string
-    :emacs-channel-send
-    :reader-error))
-
 (defun mk-valid-rpcs-hook (valid-rpcs)
   (lambda (connection)
-    (setf (connection.valid-rpcs connection) valid-rpcs)))
+    (setf (connection.valid-rpcs connection) (expand-event-handlers valid-rpcs))))
 
 (defvar *connection-closed-hook* '()
   "This hook is run when a connection is closed.
@@ -243,7 +232,7 @@ Backend code should treat the connection structure as opaque.")
   ;; reader functions used to parse an input into lisp-form.
   ;; when NIL, standard ones are used
   (reader nil :type (or function null))
-  (valid-rpcs nil :type list)
+  (valid-rpcs nil :type (or hash-table null))
   )
 
 (defun print-connection (conn stream depth)
@@ -800,15 +789,7 @@ connections, otherwise it will be closed after the first."
 
 (defparameter *loopback-interface* "127.0.0.1")
 
-(defparameter *macrochar-whitelist* '(:allow-read-eval))
-(defparameter *macrochar-blacklist* '(:t))
 (defparameter *reader* nil)
-
-(defmacro with-macrochar-secured-reader (&body body)
-  `(let ((*reader* (secure-read-from-string-lambda swank-reader-from-string
-                                                   :blacklist *macrochar-blacklist*
-                                                   :whitelist *macrochar-whitelist*)))
-     ,@body))
 
 (defun mk-custom-reader-hook (reader)
   (lambda (connection)
@@ -1107,49 +1088,66 @@ The processing is done in the extent of the toplevel restart."
            (delete thread (mconn.active-threads connection) :count 1)))
     (singlethreaded-connection)))
 
+(defparameter *valid-rpcs*
+  `((:emacs-rex (form package thread-id id)
+                (let ((thread (thread-for-evaluation connection thread-id)))
+                  (cond (thread
+                         (add-active-thread connection thread)
+                         (send-event thread `(:emacs-rex ,form ,package ,id)))
+                        (t
+                         (encode-message 
+                          (list :invalid-rpc id
+                                (format nil "Thread not found: ~s" thread-id))
+                          (current-socket-io))))))
+    (:return (thread &rest args)
+             (remove-active-thread connection thread)
+             (encode-message `(:return ,@args) (current-socket-io)))
+    (:emacs-interrupt (thread-id)
+                      (interrupt-worker-thread connection thread-id))
+    ((:write-string 
+      :debug :debug-condition :debug-activate :debug-return :channel-send
+      :presentation-start :presentation-end
+      :new-package :new-features :ed :indentation-update
+      :eval :eval-no-wait :background-message :inspect :ping
+      :y-or-n-p :read-from-minibuffer :read-string :read-aborted :test-delay)
+     (&rest _)
+     (declare (ignore _))
+     (encode-message event (current-socket-io)))
+    (:emacs-channel-send (channel-id msg)
+                         (let ((ch (find-channel channel-id)))
+                           (send-event (channel-thread ch) `(:emacs-channel-send ,ch ,msg))))
+    ((:emacs-pong :emacs-return :emacs-return-string)
+     (thread-id &rest args)
+     (send-event (find-thread thread-id) (cons (car event) args)))
+    (:reader-error (packet condition)
+                   (encode-message `(:reader-error ,packet 
+                                                   ,(safe-condition-message condition))
+                                   (current-socket-io)))))
 
+(defun expand-event-handlers (lst)
+  (let ((res-hash (make-hash-table)))
+    (dolist (elt lst)
+      (destructuring-bind (kwds args &body body) elt
+          (let ((handler (compile nil `(lambda (connection event)
+                                         (declare (ignorable connection event))
+                                         (destructuring-bind ,args (cdr event)
+                                           ,@body)))))
+            (when (keywordp kwds)
+              (setf kwds `(,kwds)))
+            (dolist (kwd kwds)
+              (setf (gethash kwd res-hash) handler)))))
+    res-hash))
+                                  
 (defun dispatch-event (connection event)
   "Handle an event triggered either by Emacs or within Lisp."
   (log-event "dispatch-event: ~s~%" event)
-  (if (and (listp event)
-           (not (member (car event) (connection.valid-rpcs connection))))
-      (encode-message
-       (list :invalid-rpc (format nil "The RPC ~a is disabled for this connection." (car event)))
-       (current-socket-io))
-      (destructure-case event
-        ((:emacs-rex form package thread-id id)
-         (let ((thread (thread-for-evaluation connection thread-id)))
-           (cond (thread
-                  (add-active-thread connection thread)
-                  (send-event thread `(:emacs-rex ,form ,package ,id)))
-                 (t
-                  (encode-message 
-                   (list :invalid-rpc id
-                         (format nil "Thread not found: ~s" thread-id))
-                   (current-socket-io))))))
-        ((:return thread &rest args)
-         (remove-active-thread connection thread)
-         (encode-message `(:return ,@args) (current-socket-io)))
-        ((:emacs-interrupt thread-id)
-         (interrupt-worker-thread connection thread-id))
-        (((:write-string 
-           :debug :debug-condition :debug-activate :debug-return :channel-send
-           :presentation-start :presentation-end
-           :new-package :new-features :ed :indentation-update
-           :eval :eval-no-wait :background-message :inspect :ping
-           :y-or-n-p :read-from-minibuffer :read-string :read-aborted :test-delay)
-          &rest _)
-         (declare (ignore _))
-         (encode-message event (current-socket-io)))
-        (((:emacs-pong :emacs-return :emacs-return-string) thread-id &rest args)
-         (send-event (find-thread thread-id) (cons (car event) args)))
-        ((:emacs-channel-send channel-id msg)
-         (let ((ch (find-channel channel-id)))
-           (send-event (channel-thread ch) `(:emacs-channel-send ,ch ,msg))))
-        ((:reader-error packet condition)
-         (encode-message `(:reader-error ,packet 
-                                         ,(safe-condition-message condition))
-                         (current-socket-io))))))
+  (assert (listp event))
+  (multiple-value-bind (handler got) (gethash (car event) (connection.valid-rpcs connection))
+    (if (not got)
+        (encode-message (list :invalid-rpc (format nil "The RPC ~a is not known for this connection." (car event)))
+                        (current-socket-io))
+        (funcall handler connection event))))
+
 
 
 (defun send-event (thread event)
