@@ -203,10 +203,10 @@ Backend code should treat the connection structure as opaque.")
              (:conc-name connection.)
              (:print-function print-connection))
   ;; The listening socket. (usually closed)
-  (socket           nil :type t :read-only t)
+  (socket           (missing-arg) :type t :read-only t)
   ;; Character I/O stream of socket connection.  Read-only to avoid
   ;; race conditions during initialization.
-  (socket-io        nil :type (or stream null) :read-only t)
+  (socket-io        (missing-arg) :type stream :read-only t)
   ;; Optional dedicated output socket (backending `user-output' slot).
   ;; Has a slot so that it can be closed with the connection.
   (dedicated-output nil :type (or stream null))
@@ -229,9 +229,11 @@ Backend code should treat the connection structure as opaque.")
   (indentation-cache-packages '())
   ;; The communication style used.
   (communication-style nil :type (member nil :spawn :sigio :fd-handler))
-  ;; reader functions used to parse an input into lisp-form.
-  ;; when NIL, standard ones are used
+  ;; reader function used to parse an input into lisp-form.
+  ;; when NIL, standard one (READ-FROM-STRING) is used
   (reader nil :type (or function null))
+  ;; hash of (RPC-code . handler) pairs, that are valid for a current connection
+  ;; used to easily morph swank to some other socket RPC-based protocol
   (valid-rpcs nil :type (or hash-table null))
   )
 
@@ -798,8 +800,6 @@ connections, otherwise it will be closed after the first."
 
 (defun setup-server (port announce-fn style dont-close backlog)
   (init-log-output)
-  ;; (format t "blacklist is: ~a~%" *macrochar-blacklist*)
-  ;; (format t "whitelist is: ~a~%" *macrochar-whitelist*)
   (let* ((socket (create-socket *loopback-interface* port :backlog backlog))
          (port (local-port socket))
          (valid-rpcs-hook (mk-valid-rpcs-hook *valid-rpcs*))
@@ -864,7 +864,6 @@ first."
   (let ((secret (slime-secret)))
     (when secret
       (set-stream-timeout stream 20)
-      ;; I have to invent a way how to propagate custom reader here.
       (let ((first-val (decode-message stream #'read-string-or-nil)))
         (unless (and (stringp first-val) (string= first-val secret))
           (error "Incoming connection doesn't know the password.")))
@@ -1113,12 +1112,12 @@ The processing is done in the extent of the toplevel restart."
      (&rest _)
      (declare (ignore _))
      (encode-message event (current-socket-io)))
-    (:emacs-channel-send (channel-id msg)
-                         (let ((ch (find-channel channel-id)))
-                           (send-event (channel-thread ch) `(:emacs-channel-send ,ch ,msg))))
     ((:emacs-pong :emacs-return :emacs-return-string)
      (thread-id &rest args)
      (send-event (find-thread thread-id) (cons (car event) args)))
+    (:emacs-channel-send (channel-id msg)
+                         (let ((ch (find-channel channel-id)))
+                           (send-event (channel-thread ch) `(:emacs-channel-send ,ch ,msg))))
     (:reader-error (packet condition)
                    (encode-message `(:reader-error ,packet 
                                                    ,(safe-condition-message condition))
