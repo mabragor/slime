@@ -28,9 +28,9 @@
    (cause :type reader-error :initarg :cause 
           :reader swank-reader-error.cause)))
 
-(defun read-message (stream package)
+(defun read-message (stream package reader)
   (let ((packet (read-packet stream)))
-    (handler-case (values (read-form packet package))
+    (handler-case (values (read-form packet package reader))
       (reader-error (c)
         (error 'swank-reader-error 
                :packet packet :cause c)))))
@@ -70,12 +70,12 @@
 (defparameter *validate-input* nil
   "Set to true to require input that strictly conforms to the protocol")
 
-(defun read-form (string package)
+(defun read-form (string package reader)
   (with-standard-io-syntax
     (let ((*package* package))
       (if *validate-input*
           (validating-read string)
-          (read-from-string string)))))
+          (funcall reader string)))))
 
 (defun validating-read (string)
   (with-input-from-string (*standard-input* string)
